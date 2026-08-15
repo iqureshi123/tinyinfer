@@ -9,7 +9,7 @@ $ python scripts/generate.py --chat "Explain what a KV cache does in one sentenc
 A KV cache is a data structure that stores frequently accessed data in memory,
 allowing for quick retrieval of information.
 
-[23 tokens in 2.21s — 10.4 tok/s, cache=on, quant=none]
+[23 tokens in 0.87s — 26.4 tok/s, cache=on, quant=none]
 ```
 
 ---
@@ -21,10 +21,10 @@ allowing for quick retrieval of information.
 | 1. Parse safetensors | ✅ | 290 tensors, 494,032,768 params, every shape cross-checked against config |
 | 2. BPE tokenizer | ✅ | 10000/10000 exact id match and exact round-trip vs reference |
 | 3. fp32 forward pass | ✅ | logits within 4.44e-04 of reference (tol 1e-3), top-1 100% at every position |
-| 4. KV cache | ✅ | output ids **identical** to uncached, 1.27×→5.71× as context grows 32→512 |
+| 4. KV cache | ✅ | output ids **identical** to uncached, 1.33×→6.29× as context grows 32→512 |
 | 5. Sampling | ✅ | temperature / top-k / top-p, seeded and reproducible |
 | 6. Quantization + study | ✅ | INT8 free, INT4 costly, and the cost is **not uniform** — see below |
-| 7. Metal compute kernels | 🔨 | benchmark harness and stage timings in place; kernels not started |
+| 7. Optimize the hot path | 🔨 | profiled; **1.95× from a float64 promotion fix**; Metal kernels not started |
 | 8. Benchmark vs llama.cpp | ⛔ | not started |
 
 Phases 1–6 are Python + NumPy, correctness first. Phases 7–8 move the hot path to C++/Metal.
@@ -104,23 +104,29 @@ Apple M5, 24 GB, NumPy fp32 over Accelerate BLAS. Percentiles, not means — a m
 
 | | tok/s | p50 | p99 |
 |---|---|---|---|
-| prefill | 66.2 | — | — |
-| decode | 14.7 | 67.5 ms | 75.2 ms |
+| prefill | 131.2 | — | — |
+| decode | 26.2 | 34.9 ms | 79.7 ms |
 
 Prefill and decode are reported separately because they are different regimes: prefill is compute-bound across the whole prompt, decode is memory-bound on a single token. Averaging them produces a number that describes neither.
 
-**The KV cache speedup is a curve, not a constant.** Phase 4 measured 1.78× at 37 positions and that understates it badly — the cache removes quadratic work, so the win grows with context:
+**These numbers are 1.95× what they were before profiling.** Phase 7 began with a profile rather than a kernel, and the profile found a one-line bug worth more than any kernel would have been: `scores / np.sqrt(head_dim)` was silently promoting the entire attention path to float64, because `np.sqrt` returns a float64 *numpy scalar* and those promote float32 arrays under NEP 50. The mixed-dtype matmul that followed lost the fast BLAS path — 947 µs against 13.6 µs on that op alone.
+
+Every correctness test passed the whole time. Float64 is *more* precise, so the bug made the reference comparison agree slightly better (4.44e-04 before, 4.71e-04 after) while halving throughput. A defect that improves your accuracy metric and halves your speed is invisible to correctness testing by construction. Full account in [`LOG.md`](LOG.md); [`tests/test_dtypes.py`](tests/test_dtypes.py) now asserts float32 through every primitive, the cache, and all 290 weights.
+
+**The KV cache speedup is a curve, not a constant.** Phase 4 measured 1.78× at 37 positions, which understates it badly — the cache removes quadratic work, so the win grows with context:
 
 | Context | Cached | Uncached | Speedup |
 |---|---|---|---|
-| 32 | 7.4 tok/s | 5.8 tok/s | 1.27× |
-| 128 | 9.2 tok/s | 2.4 tok/s | 3.83× |
-| 256 | 6.9 tok/s | 1.6 tok/s | 4.17× |
-| 512 | 3.9 tok/s | 0.7 tok/s | **5.71×** |
+| 32 | 10.5 tok/s | 7.9 tok/s | 1.33× |
+| 128 | 13.6 tok/s | 3.0 tok/s | 4.52× |
+| 256 | 10.1 tok/s | 2.0 tok/s | 5.13× |
+| 512 | 5.6 tok/s | 0.9 tok/s | **6.29×** |
 
-Quantized decode currently measures within noise of fp32 (14.7 → 15.0 tok/s), because weights are dequantized to fp32 before the matmul. That is deliberate: it isolates the *quality* cost, which is what the study measures. Throughput gains need a real INT4 kernel — phase 7.
+Quantized decode measures within noise of fp32, because weights are dequantized to fp32 before the matmul. That is deliberate: it isolates the *quality* cost, which is what the study measures. Throughput gains need a real INT4 kernel.
 
-Reproduce with `python scripts/bench.py`; raw numbers in [`results/bench.json`](results/bench.json).
+Where the time actually goes, per decode token ([`results/profile.json`](results/profile.json)): **96.9% is matmul**, and the three MLP projections are 65% on their own. That is the case for a GPU kernel, and it also caps every non-matmul optimization at 3.1% of the budget.
+
+Reproduce with `python scripts/bench.py` and `python scripts/profile_forward.py`.
 
 ## How it works
 
@@ -161,6 +167,7 @@ python tests/test_tokenizer.py      # phase 2 — 10,000 strings, exact
 python tests/test_forward.py        # phase 3 — logits vs transformers
 python tests/test_kv_cache.py       # phase 4 — cached == uncached
 python tests/test_sampling.py       # phase 5 — reproducibility
+python tests/test_dtypes.py         # phase 7 — no silent float64 promotion
 python scripts/quant_study.py       # phase 6 — the study
 ```
 
