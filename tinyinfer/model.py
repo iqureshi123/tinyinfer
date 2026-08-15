@@ -221,7 +221,14 @@ class Qwen2:
         k = repeat_kv(k, cfg.kv_groups)
         v = repeat_kv(v, cfg.kv_groups)
 
-        scores = (q @ k.transpose(0, 2, 1)) / np.sqrt(hd)
+        # The cast on the scale is load-bearing. np.sqrt(hd) returns a float64
+        # scalar, and under NEP 50 a float64 *numpy scalar* promotes a float32
+        # array — so this one division silently turned every downstream op
+        # (softmax, the weighted sum, o_proj) into float64. Output stayed
+        # correct, which is why it survived every correctness gate, but the
+        # mixed-dtype matmul that followed lost the fast BLAS path and ran ~70x
+        # slower. See LOG.md.
+        scores = (q @ k.transpose(0, 2, 1)) * np.float32(1.0 / np.sqrt(hd))
         scores = scores + mask
         attn = softmax(scores, axis=-1) @ v                      # (heads, seq, dim)
 
