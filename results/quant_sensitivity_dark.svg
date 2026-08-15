@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="636" height="422" viewBox="0 0 636 422" font-family="ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" role="img" aria-label="Perplexity cost of INT4 quantization by weight matrix type">
+<rect width="636" height="422" fill="#1a1a19"/>
+<text x="24" y="28" fill="#ffffff" font-size="15" font-weight="600">Which weights tolerate INT4?</text>
+<text x="24" y="47" fill="#c3c2b7" font-size="11.5">Perplexity cost when only that matrix type is quantized (INT4, group 128, asymmetric)</text>
+<line x1="132.0" y1="56" x2="132.0" y2="382" stroke="#2e2e2c" stroke-width="1"/>
+<text x="132.0" y="398" fill="#c3c2b7" font-size="11" text-anchor="middle">+0%</text>
+<line x1="203.7" y1="56" x2="203.7" y2="382" stroke="#2e2e2c" stroke-width="1"/>
+<text x="203.7" y="398" fill="#c3c2b7" font-size="11" text-anchor="middle">+5%</text>
+<line x1="275.3" y1="56" x2="275.3" y2="382" stroke="#2e2e2c" stroke-width="1"/>
+<text x="275.3" y="398" fill="#c3c2b7" font-size="11" text-anchor="middle">+10%</text>
+<line x1="347.0" y1="56" x2="347.0" y2="382" stroke="#2e2e2c" stroke-width="1"/>
+<text x="347.0" y="398" fill="#c3c2b7" font-size="11" text-anchor="middle">+15%</text>
+<line x1="418.7" y1="56" x2="418.7" y2="382" stroke="#2e2e2c" stroke-width="1"/>
+<text x="418.7" y="398" fill="#c3c2b7" font-size="11" text-anchor="middle">+20%</text>
+<line x1="490.3" y1="56" x2="490.3" y2="382" stroke="#2e2e2c" stroke-width="1"/>
+<text x="490.3" y="398" fill="#c3c2b7" font-size="11" text-anchor="middle">+25%</text>
+<line x1="562.0" y1="56" x2="562.0" y2="382" stroke="#2e2e2c" stroke-width="1"/>
+<text x="562.0" y="398" fill="#c3c2b7" font-size="11" text-anchor="middle">+30%</text>
+<text x="120" y="81.0" fill="#c3c2b7" font-size="12" text-anchor="end" font-weight="600">all MLP</text>
+<path d="M132 64 h365.8 a4 4 0 0 1 4 4 v18 a4 4 0 0 1 -4 4 h-365.8 z" fill="#3987e5" fill-opacity="0.45"/>
+<text x="509.8" y="81.0" fill="#c3c2b7" font-size="11.5">+25.80%</text>
+<text x="120" y="117.0" fill="#c3c2b7" font-size="12" text-anchor="end" font-weight="600">all attention</text>
+<path d="M132 100 h185.4 a4 4 0 0 1 4 4 v18 a4 4 0 0 1 -4 4 h-185.4 z" fill="#3987e5" fill-opacity="0.45"/>
+<text x="329.4" y="117.0" fill="#c3c2b7" font-size="11.5">+13.21%</text>
+<text x="120" y="153.0" fill="#ffffff" font-size="12" text-anchor="end">down_proj</text>
+<path d="M132 136 h154.0 a4 4 0 0 1 4 4 v18 a4 4 0 0 1 -4 4 h-154.0 z" fill="#3987e5" fill-opacity="1"/>
+<text x="298.0" y="153.0" fill="#c3c2b7" font-size="11.5">+11.02%</text>
+<text x="120" y="189.0" fill="#ffffff" font-size="12" text-anchor="end">v_proj</text>
+<path d="M132 172 h108.2 a4 4 0 0 1 4 4 v18 a4 4 0 0 1 -4 4 h-108.2 z" fill="#3987e5" fill-opacity="1"/>
+<text x="252.2" y="189.0" fill="#c3c2b7" font-size="11.5">+7.83%</text>
+<text x="120" y="225.0" fill="#ffffff" font-size="12" text-anchor="end">up_proj</text>
+<path d="M132 208 h105.4 a4 4 0 0 1 4 4 v18 a4 4 0 0 1 -4 4 h-105.4 z" fill="#3987e5" fill-opacity="1"/>
+<text x="249.4" y="225.0" fill="#c3c2b7" font-size="11.5">+7.64%</text>
+<text x="120" y="261.0" fill="#ffffff" font-size="12" text-anchor="end">gate_proj</text>
+<path d="M132 244 h48.1 a4 4 0 0 1 4 4 v18 a4 4 0 0 1 -4 4 h-48.1 z" fill="#3987e5" fill-opacity="1"/>
+<text x="192.1" y="261.0" fill="#c3c2b7" font-size="11.5">+3.64%</text>
+<text x="120" y="297.0" fill="#ffffff" font-size="12" text-anchor="end">o_proj</text>
+<path d="M132 280 h33.3 a4 4 0 0 1 4 4 v18 a4 4 0 0 1 -4 4 h-33.3 z" fill="#3987e5" fill-opacity="1"/>
+<text x="177.3" y="297.0" fill="#c3c2b7" font-size="11.5">+2.60%</text>
+<text x="120" y="333.0" fill="#ffffff" font-size="12" text-anchor="end">q_proj</text>
+<path d="M132 316 h13.9 a4 4 0 0 1 4 4 v18 a4 4 0 0 1 -4 4 h-13.9 z" fill="#3987e5" fill-opacity="1"/>
+<text x="157.9" y="333.0" fill="#c3c2b7" font-size="11.5">+1.25%</text>
+<text x="120" y="369.0" fill="#ffffff" font-size="12" text-anchor="end">k_proj</text>
+<path d="M132 352 h-2.0 a4 4 0 0 1 4 4 v18 a4 4 0 0 1 -4 4 h--2.0 z" fill="#3987e5" fill-opacity="1"/>
+<text x="142.0" y="369.0" fill="#c3c2b7" font-size="11.5">+0.14%</text>
+<line x1="132" y1="56" x2="132" y2="382" stroke="#4a4a46" stroke-width="1"/>
+<text x="24" y="412" fill="#c3c2b7" font-size="10.5">Qwen2.5-0.5B-Instruct · 1,024 held-out tokens · fp32 baseline ppl 13.138</text>
+</svg>
