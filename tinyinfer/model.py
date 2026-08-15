@@ -219,21 +219,32 @@ class Qwen2:
         return h @ self.w(head).T
 
     def generate(self, token_ids: list[int], max_new_tokens: int,
-                 use_cache: bool = True) -> list[int]:
-        """Greedy decode. Returns only the newly generated ids."""
+                 use_cache: bool = True, sampler=None,
+                 stop_ids: set[int] | None = None) -> list[int]:
+        """Decode `max_new_tokens`. Returns only the newly generated ids.
+
+        `sampler` is any callable (vocab,) -> int; None means greedy argmax.
+        """
+        pick = sampler if sampler is not None else (lambda lg: int(lg.argmax()))
+        stop = stop_ids or set()
         out: list[int] = []
+
         if use_cache:
             cache = KVCache(self.config, capacity=len(token_ids) + max_new_tokens)
             logits = self.forward(token_ids, cache)
             for _ in range(max_new_tokens):
-                nxt = int(logits[-1].argmax())
+                nxt = pick(logits[-1])
                 out.append(nxt)
+                if nxt in stop:
+                    break
                 logits = self.forward([nxt], cache)
         else:
             ids = list(token_ids)
             for _ in range(max_new_tokens):
-                nxt = int(self.forward(ids)[-1].argmax())
+                nxt = pick(self.forward(ids)[-1])
                 out.append(nxt)
+                if nxt in stop:
+                    break
                 ids.append(nxt)
         return out
 
