@@ -5,9 +5,11 @@ An LLM inference engine written from scratch — no PyTorch `generate()`, no `tr
 Target model: **Qwen2.5-0.5B-Instruct**. Target hardware: **Apple M5, 24 GB**.
 
 ```
-$ python -c "from tinyinfer.model import Qwen2; from tinyinfer.tokenizer import Tokenizer; ..."
-'The capital of France is' -> ' Paris. It is the largest city in Europe and the third
- largest city in the world. It is located in the south of France, on the banks of the'
+$ python scripts/generate.py --chat "Explain what a KV cache does in one sentence."
+A KV cache is a data structure that stores frequently accessed data in memory,
+allowing for quick retrieval of information.
+
+[23 tokens in 2.21s — 10.4 tok/s, cache=on, quant=none]
 ```
 
 ---
@@ -29,21 +31,56 @@ Phases 1–6 are Python + NumPy, correctness first. Phases 7–8 move the hot pa
 
 ## The finding
 
-Quantization is usually reported as one number per bit width. That hides the more useful result: **weight matrices do not degrade equally.** Quantizing only `k_proj` to INT4 is nearly free; quantizing only `down_proj` costs almost eighty times more perplexity, for the same bits saved.
+Quantization is usually reported as one number per bit width. That hides the more useful result: **weight matrices do not degrade equally.** Quantizing only `k_proj` to INT4 costs +0.44% perplexity. Quantizing only `down_proj` — same bit width, same group size, same bits saved — costs **16× more**.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="results/quant_sensitivity_dark.svg">
   <img alt="Perplexity cost of INT4 quantization by weight matrix type" src="results/quant_sensitivity_light.svg">
 </picture>
 
-Three things fall out of it:
+Measured on 3,072 held-out tokens, fp32 baseline perplexity **12.7891**.
 
-- **INT8 is free.** Perplexity moves by a fraction of a percent at ~4× compression. There is no reason to ship fp32 weights.
-- **INT4 is not free, and group size is the lever.** Halving the group from 128 to 64 recovers a large share of the loss for a few percent more metadata.
-- **MLP matrices are the fragile ones.** Attention as a whole absorbs INT4 far better than the feed-forward block, and `down_proj` is the single worst matrix in the model — which is the argument for mixed-precision rather than uniform quantization.
-- **Depth barely matters.** Early, middle, and late blocks land within about a percentage point of each other. This is a *negative* result and is reported because it rules out a plausible and commonly assumed strategy.
+### 1. INT8 is free. INT4 is not, and the cliff is right below it.
 
-Full numbers: [`results/quant_study.json`](results/quant_study.json). Reproduce with `python scripts/quant_study.py`.
+| Scheme | Perplexity | Δ | Compression |
+|---|---|---|---|
+| fp32 | 12.7891 | — | 1.00× |
+| INT8 g128 asym | 12.7754 | **−0.11%** | 3.88× |
+| INT4 g32 asym | 14.6141 | +14.27% | 6.40× |
+| INT4 g128 asym | 16.4615 | +28.72% | 7.53× |
+| INT3 g64 asym | 36.6353 | +186.46% | 9.14× |
+| INT2 g64 asym | 608,112 | +4,754,844% | 12.80× |
+
+The degradation is **not gradual**. INT8 is indistinguishable from fp32, INT4 is expensive but usable, INT3 nearly triples perplexity, and INT2 destroys the model outright — 608,112 is not a degraded model, it is noise. Anyone planning a bit-width sweep should know the useful range ends at 4.
+
+### 2. Group size is the main lever, and asymmetric is not optional
+
+| INT4 config | Δ perplexity |
+|---|---|
+| g256 asym | +36.02% |
+| g128 asym | +28.72% |
+| g64 asym | +19.33% |
+| g32 asym | +14.27% |
+| g128 **sym** | +42.38% |
+| g64 **sym** | +30.10% |
+
+Shrinking groups from 256 to 32 cuts the loss by more than half for ~17% less compression. And at equal group size, dropping the zero point costs about as much as doubling the group — symmetric g64 (+30.10%) is barely better than asymmetric g128 (+28.72%) while storing more metadata. The extra zero point pays for itself.
+
+### 3. MLP is twice as fragile as attention
+
+Quantizing the whole attention block costs +9.23%; the whole MLP block costs +18.49%. Per matrix, the spread runs from `k_proj` (+0.44%) to `down_proj` (+7.25%). That spread is the argument for mixed precision: keeping the three worst matrix types at INT8 and quantizing the rest to INT4 should recover most of the quality at most of the compression.
+
+### 4. Depth barely matters — a negative result
+
+| Blocks quantized to INT4 | Δ perplexity |
+|---|---|
+| 0–7 (early) | +8.13% |
+| 8–15 (middle) | +7.34% |
+| 16–23 (late) | +9.30% |
+
+Within about two percentage points of each other. "Protect the early layers" is a plausible and commonly assumed strategy, and on this model it is not supported. Reported because a strategy ruled out is worth as much as one confirmed.
+
+Full numbers: [`results/quant_study.json`](results/quant_study.json). Reproduce with `python scripts/quant_study.py` (~20 min).
 
 ## How it works
 
