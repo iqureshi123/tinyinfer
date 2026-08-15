@@ -1,0 +1,27 @@
+name: tests
+
+# Phases 1-5 need the model weights (~1 GB), so the full suite runs locally.
+# CI covers what can be checked without a download: the tokenizer against a
+# vocab reconstructed from the repo, the quantizer against synthetic tensors,
+# and the sampler, which needs no model at all.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - name: Quantizer round-trip properties
+        run: python tests/test_quant.py
+      - name: Import check — tinyinfer must not import any oracle
+        run: |
+          ! grep -rE "^\s*(import|from)\s+(torch|transformers|tokenizers)\b" tinyinfer/ \
+            || (echo "tinyinfer/ imported a test oracle" && exit 1)
+          echo "clean: no oracle imports in tinyinfer/"

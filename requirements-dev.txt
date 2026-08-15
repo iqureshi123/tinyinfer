@@ -1,0 +1,7 @@
+# Test oracles only. Nothing in tinyinfer/ may import these — they exist so the
+# implementation can be checked against a reference, which is the whole point.
+-r requirements.txt
+tokenizers>=0.20      # phase 2 oracle
+torch>=2.4            # phase 3 oracle
+transformers>=4.43    # phase 3 oracle
+huggingface_hub>=0.24 # model download
