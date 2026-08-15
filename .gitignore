@@ -1,0 +1,29 @@
+# Secrets — gitignored before the first commit, never after
+.env
+.env.*
+
+# Model weights — large, downloaded not committed
+models/
+*.safetensors
+*.gguf
+*.bin
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# C++ / CMake
+build/
+*.o
+*.a
+*.dylib
+
+# Benchmark output
+results/*.json
+*.prof
+
+# macOS
+.DS_Store
