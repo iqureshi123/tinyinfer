@@ -21,10 +21,10 @@ allowing for quick retrieval of information.
 | 1. Parse safetensors | ✅ | 290 tensors, 494,032,768 params, every shape cross-checked against config |
 | 2. BPE tokenizer | ✅ | 10000/10000 exact id match and exact round-trip vs reference |
 | 3. fp32 forward pass | ✅ | logits within 4.44e-04 of reference (tol 1e-3), top-1 100% at every position |
-| 4. KV cache | ✅ | output ids **identical** to uncached, 1.78× at 37 positions |
+| 4. KV cache | ✅ | output ids **identical** to uncached, 1.27×→5.71× as context grows 32→512 |
 | 5. Sampling | ✅ | temperature / top-k / top-p, seeded and reproducible |
 | 6. Quantization + study | ✅ | INT8 free, INT4 costly, and the cost is **not uniform** — see below |
-| 7. Metal compute kernels | ⛔ | not started |
+| 7. Metal compute kernels | 🔨 | benchmark harness and stage timings in place; kernels not started |
 | 8. Benchmark vs llama.cpp | ⛔ | not started |
 
 Phases 1–6 are Python + NumPy, correctness first. Phases 7–8 move the hot path to C++/Metal.
@@ -82,6 +82,30 @@ Within about two percentage points of each other. "Protect the early layers" is 
 
 Full numbers: [`results/quant_study.json`](results/quant_study.json). Reproduce with `python scripts/quant_study.py` (~20 min).
 
+## Performance
+
+Apple M5, 24 GB, NumPy fp32 over Accelerate BLAS. Percentiles, not means — a mean hides the stalls that decide whether generation reads as smooth.
+
+| | tok/s | p50 | p99 |
+|---|---|---|---|
+| prefill | 66.2 | — | — |
+| decode | 14.7 | 67.5 ms | 75.2 ms |
+
+Prefill and decode are reported separately because they are different regimes: prefill is compute-bound across the whole prompt, decode is memory-bound on a single token. Averaging them produces a number that describes neither.
+
+**The KV cache speedup is a curve, not a constant.** Phase 4 measured 1.78× at 37 positions and that understates it badly — the cache removes quadratic work, so the win grows with context:
+
+| Context | Cached | Uncached | Speedup |
+|---|---|---|---|
+| 32 | 7.4 tok/s | 5.8 tok/s | 1.27× |
+| 128 | 9.2 tok/s | 2.4 tok/s | 3.83× |
+| 256 | 6.9 tok/s | 1.6 tok/s | 4.17× |
+| 512 | 3.9 tok/s | 0.7 tok/s | **5.71×** |
+
+Quantized decode currently measures within noise of fp32 (14.7 → 15.0 tok/s), because weights are dequantized to fp32 before the matmul. That is deliberate: it isolates the *quality* cost, which is what the study measures. Throughput gains need a real INT4 kernel — phase 7.
+
+Reproduce with `python scripts/bench.py`; raw numbers in [`results/bench.json`](results/bench.json).
+
 ## How it works
 
 ```
@@ -130,7 +154,6 @@ The tokenizer corpus covers whitespace runs, CJK, ZWJ emoji sequences, NFC/NFD p
 
 - **No GPU path yet.** Everything runs on NumPy over Accelerate BLAS. The tokens/sec figures are what a correctness-first CPU implementation gives you, and are not competitive with llama.cpp. That comparison is phase 8 and will be published whether or not it wins.
 - **Quantized weights are dequantized to fp32 before the matmul.** That measures the quality cost exactly, which is what the study is for, but it means quantization currently buys compression and not speed. Real throughput needs the INT4 kernel.
-- **The 1.78× cache speedup is measured at 37 positions**, where the quadratic term barely dominates. `scripts/bench.py` measures the curve across context lengths; the single number understates the win at realistic lengths.
 - **One model, one machine.** Everything here is Qwen2.5-0.5B on an M5. Nothing has been checked against a second architecture or a non-Apple target.
 - **Perplexity is measured on one corpus** (Alice in Wonderland). It is public-domain, shipped in the repo, and reproducible offline — but a single domain, and the quantization result could differ on code or multilingual text.
 
