@@ -126,6 +126,16 @@ class Qwen2:
         self.st = SafeTensors(self.dir / "model.safetensors")
         self._cache: dict[str, np.ndarray] = {}
 
+    # Linear projections eligible for quantization. Norms and biases are
+    # excluded: they are 1-D, contribute well under 0.1% of parameters, and are
+    # disproportionately sensitive — quantizing them costs quality and saves
+    # nothing measurable.
+    QUANTIZABLE = (
+        "self_attn.q_proj.weight", "self_attn.k_proj.weight",
+        "self_attn.v_proj.weight", "self_attn.o_proj.weight",
+        "mlp.gate_proj.weight", "mlp.up_proj.weight", "mlp.down_proj.weight",
+    )
+
     def w(self, name: str) -> np.ndarray:
         """Fetch a weight, decoding bf16 -> f32 once and keeping it resident."""
         arr = self._cache.get(name)
@@ -133,6 +143,50 @@ class Qwen2:
             arr = np.ascontiguousarray(self.st.get(name))
             self._cache[name] = arr
         return arr
+
+    def quantizable_names(self, include_embeddings: bool = False) -> list[str]:
+        names = [f"model.layers.{i}.{suffix}"
+                 for i in range(self.config.num_hidden_layers)
+                 for suffix in self.QUANTIZABLE]
+        if include_embeddings:
+            names.append("model.embed_tokens.weight")
+        return names
+
+    def apply_quantization(self, quant_config, names: list[str] | None = None) -> dict:
+        """Round-trip the named weights through quantization, in place.
+
+        Weights are replaced by their dequantized reconstruction, so this
+        measures the *quality* cost exactly while leaving the arithmetic in
+        fp32. Speed and real memory savings come from the C++/Metal port, not
+        from here — conflating the two is how quantization results get
+        overstated.
+        """
+        from .quant import error_stats, quantize, dequantize
+
+        names = names if names is not None else self.quantizable_names()
+        stored = orig_bytes = 0
+        per_tensor = {}
+
+        for name in names:
+            original = self.w(name)
+            qt = quantize(original, quant_config)
+            recon = dequantize(qt)
+            per_tensor[name] = error_stats(original, recon)
+            stored += qt.stored_bytes
+            orig_bytes += qt.fp32_bytes
+            self._cache[name] = np.ascontiguousarray(recon)
+
+        return {
+            "tensors": len(names),
+            "stored_bytes": stored,
+            "fp32_bytes": orig_bytes,
+            "compression": orig_bytes / stored if stored else 0.0,
+            "per_tensor": per_tensor,
+        }
+
+    def reset_weights(self) -> None:
+        """Drop the resident cache so weights reload from disk at full precision."""
+        self._cache.clear()
 
     def _block(self, h: np.ndarray, i: int, cos: np.ndarray,
                sin: np.ndarray, mask: np.ndarray,
