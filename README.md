@@ -8,20 +8,30 @@ Target model: **Qwen2.5-0.5B-Instruct**. Target hardware: **Apple M5, 24 GB**.
 
 ## Status — read this first
 
-**Nothing works yet. This README was written before the code, on purpose.**
+**It generates text.** Phases 1–4 are done and verified; the engine runs Qwen2.5-0.5B end to end in NumPy at ~19 tok/s. Everything after phase 4 is unwritten.
 
-| Phase | State |
-|---|---|
-| 1. Parse safetensors, print layer names and shapes | ⛔ Not started |
-| 2. BPE tokenizer, exact round-trip on 10,000 strings | ⛔ Not started |
-| 3. Naive fp32 forward pass, logits match reference within 1e-3 | ⛔ Not started |
-| 4. KV cache — identical output, measured speedup | ⛔ Not started |
-| 5. Sampling: temperature, top-k, top-p, seeded RNG | ⛔ Not started |
-| 6. INT8 → INT4 quantization, perplexity at each level | ⛔ Not started |
-| 7. Metal compute kernels for the hot loop | ⛔ Not started |
-| 8. Benchmark vs. llama.cpp, identical model and hardware | ⛔ Not started |
+| Phase | State | Result |
+|---|---|---|
+| 1. Parse safetensors, print layer names and shapes | ✅ | 290 tensors, 494,032,768 params, all shapes match config |
+| 2. BPE tokenizer, exact round-trip on 10,000 strings | ✅ | 10000/10000 exact id match and exact round-trip |
+| 3. Naive fp32 forward pass, logits match reference | ✅ | 4.44e-04 worst case (tol 1e-3), top-1 100% at every position |
+| 4. KV cache — identical output, measured speedup | ✅ | identical ids, 1.78× at 37 positions |
+| 5. Sampling: temperature, top-k, top-p, seeded RNG | ⛔ | — |
+| 6. INT8 → INT4 quantization, perplexity at each level | ⛔ | — |
+| 7. Metal compute kernels for the hot loop | ⛔ | — |
+| 8. Benchmark vs. llama.cpp, identical model and hardware | ⛔ | — |
 
-Phases 1–3 are Python + NumPy, correctness only. Phases 6–8 move the hot path to C++ and Metal.
+Phases 1–5 are Python + NumPy, correctness only. Phases 6–8 move the hot path to C++ and Metal.
+
+```
+$ python tests/test_forward.py
+'The capital of France is' -> ' Paris. It is the largest city in'
+```
+
+**On the cache speedup:** 1.78× is measured at 37 positions, where the quadratic
+term barely dominates yet. The win scales with context length — that number should
+be re-measured at 512 and 2048 tokens, and the curve is more honest than any single
+figure. Not done yet.
 
 ## What gets measured
 

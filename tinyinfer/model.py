@@ -135,7 +135,8 @@ class Qwen2:
         return arr
 
     def _block(self, h: np.ndarray, i: int, cos: np.ndarray,
-               sin: np.ndarray, mask: np.ndarray) -> np.ndarray:
+               sin: np.ndarray, mask: np.ndarray,
+               cache: "KVCache | None" = None) -> np.ndarray:
         cfg = self.config
         p = f"model.layers.{i}."
         seq = h.shape[0]
@@ -153,8 +154,15 @@ class Qwen2:
         k = k.reshape(seq, n_kv, hd).transpose(1, 0, 2)
         v = v.reshape(seq, n_kv, hd).transpose(1, 0, 2)
 
+        # RoPE is applied to the new positions only. Cached k was already
+        # rotated at the position it was written, which is exactly why the
+        # cache is valid: rotation depends on absolute position, not on what
+        # comes after it.
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
+
+        if cache is not None:
+            k, v = cache.append(i, k, v)
 
         k = repeat_kv(k, cfg.kv_groups)
         v = repeat_kv(v, cfg.kv_groups)
@@ -174,20 +182,34 @@ class Qwen2:
 
         return h
 
-    def forward(self, token_ids: list[int]) -> np.ndarray:
-        """Run the full stack. Returns logits of shape (seq, vocab)."""
+    def forward(self, token_ids: list[int],
+                cache: "KVCache | None" = None) -> np.ndarray:
+        """Run the full stack. Returns logits of shape (seq, vocab).
+
+        With a cache, `token_ids` are the *new* tokens only and positions
+        continue from whatever the cache already holds.
+        """
         cfg = self.config
         seq = len(token_ids)
+        past = cache.length if cache is not None else 0
 
         h = self.w("model.embed_tokens.weight")[token_ids].astype(np.float32)
 
-        cos, sin = rope_tables(seq, cfg.head_dim, cfg.rope_theta)
+        cos, sin = rope_tables(seq, cfg.head_dim, cfg.rope_theta, offset=past)
 
-        # Causal mask: -inf above the diagonal, added to scores before softmax.
-        mask = np.triu(np.full((seq, seq), -np.inf, dtype=np.float32), k=1)
+        # Causal mask over (new queries x all keys). With a cache the new tokens
+        # may attend to every cached position, so only the square block on the
+        # right is masked above its own diagonal.
+        mask = np.zeros((seq, past + seq), dtype=np.float32)
+        mask[:, past:] = np.triu(
+            np.full((seq, seq), -np.inf, dtype=np.float32), k=1
+        )
 
         for i in range(cfg.num_hidden_layers):
-            h = self._block(h, i, cos, sin, mask)
+            h = self._block(h, i, cos, sin, mask, cache)
+
+        if cache is not None:
+            cache.commit(seq)
 
         h = rms_norm(h, self.w("model.norm.weight"), cfg.rms_norm_eps)
 
@@ -195,3 +217,62 @@ class Qwen2:
         head = ("model.embed_tokens.weight" if cfg.tie_word_embeddings
                 else "lm_head.weight")
         return h @ self.w(head).T
+
+    def generate(self, token_ids: list[int], max_new_tokens: int,
+                 use_cache: bool = True) -> list[int]:
+        """Greedy decode. Returns only the newly generated ids."""
+        out: list[int] = []
+        if use_cache:
+            cache = KVCache(self.config, capacity=len(token_ids) + max_new_tokens)
+            logits = self.forward(token_ids, cache)
+            for _ in range(max_new_tokens):
+                nxt = int(logits[-1].argmax())
+                out.append(nxt)
+                logits = self.forward([nxt], cache)
+        else:
+            ids = list(token_ids)
+            for _ in range(max_new_tokens):
+                nxt = int(self.forward(ids)[-1].argmax())
+                out.append(nxt)
+                ids.append(nxt)
+        return out
+
+
+class KVCache:
+    """Per-layer key/value store, preallocated to `capacity` positions.
+
+    Preallocating matters: growing with np.concatenate reallocates and copies the
+    whole history on every single token, which turns the cache's linear win back
+    into quadratic work and is the classic way this optimization silently fails.
+    """
+
+    def __init__(self, config: Config, capacity: int):
+        self.capacity = capacity
+        self.length = 0          # positions committed so far
+        shape = (config.num_key_value_heads, capacity, config.head_dim)
+        self.k = [np.zeros(shape, dtype=np.float32)
+                  for _ in range(config.num_hidden_layers)]
+        self.v = [np.zeros(shape, dtype=np.float32)
+                  for _ in range(config.num_hidden_layers)]
+
+    def append(self, layer: int, k: np.ndarray,
+               v: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Write this layer's new k/v and return the full history as views.
+
+        `length` is not advanced here — every layer in a step writes at the same
+        offset, so the counter only moves once the step is done.
+        """
+        n = k.shape[1]
+        end = self.length + n
+        if end > self.capacity:
+            raise ValueError(f"KV cache overflow: {end} > {self.capacity}")
+        self.k[layer][:, self.length : end] = k
+        self.v[layer][:, self.length : end] = v
+        return self.k[layer][:, :end], self.v[layer][:, :end]
+
+    def commit(self, n: int) -> None:
+        self.length += n
+
+    @property
+    def nbytes(self) -> int:
+        return sum(a.nbytes for a in self.k) + sum(a.nbytes for a in self.v)
