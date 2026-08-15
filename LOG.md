@@ -75,3 +75,29 @@ Format:
 **Actually was:** the real cause
 **Cost:** how long
 -->
+
+## 2026-08-15 — the mixed-precision hypothesis was wrong
+
+**Symptom:** not a bug. The README predicted, in writing, that mixed precision
+would beat uniform INT4 — keep the fragile matrices at INT8, push the robust
+ones to INT4, recover most of the quality at most of the compression.
+
+**Thought it was:** obviously correct. The per-layer study showed a 16x spread
+between `k_proj` (+0.44%) and `down_proj` (+7.25%) at identical bit width. If
+some matrices are that much more fragile, spending more bits on them should be
+the efficient allocation.
+
+**Actually was:** it wins on quality and loses on the tradeoff. Mixed INT4/INT8
+with `down_proj` promoted reaches +18.42% at 5.42 bits/weight. Uniform INT4 at
+group size 64 reaches +19.33% at **4.50** bits. Same quality, nearly a full bit
+per weight cheaper. Group size dominates matrix-type selection.
+
+The error was comparing schemes on perplexity alone. Any scheme that spends
+more bits looks better on that axis, which makes the comparison meaningless
+unless size is held roughly fixed. Once both axes were plotted the conclusion
+inverted.
+
+**Cost:** no debugging time, but it would have shipped as a false claim in the
+README if the prediction had not been tested. Written down because the habit
+that caught it — state the prediction, then measure it — is the transferable
+part, not the result.

@@ -68,7 +68,23 @@ Shrinking groups from 256 to 32 cuts the loss by more than half for ~17% less co
 
 ### 3. MLP is twice as fragile as attention
 
-Quantizing the whole attention block costs +9.23%; the whole MLP block costs +18.49%. Per matrix, the spread runs from `k_proj` (+0.44%) to `down_proj` (+7.25%). That spread is the argument for mixed precision: keeping the three worst matrix types at INT8 and quantizing the rest to INT4 should recover most of the quality at most of the compression.
+Quantizing the whole attention block costs +9.23%; the whole MLP block costs +18.49%. Per matrix, the spread runs from `k_proj` (+0.44%) to `down_proj` (+7.25%) — a 16× range at identical bit width.
+
+The obvious move is mixed precision: keep the fragile matrices at INT8, push the robust ones to INT4. **It does not pay off, and that is the more useful finding.**
+
+| Scheme | Perplexity | Δ | Avg bits/weight | Compression |
+|---|---|---|---|---|
+| uniform INT4 g128 | 16.4615 | +28.72% | 4.25 | 7.53× |
+| uniform INT4 **g64** | 15.2611 | **+19.33%** | **4.50** | **7.11×** |
+| INT4 + INT8 on `down_proj` | 15.1453 | +18.42% | 5.42 | 5.90× |
+| INT4 + INT8 on `down`, `up` | 14.4008 | +12.60% | 6.59 | 4.86× |
+| INT4 + INT8 on `down`, `up`, `v` | 13.6471 | +6.71% | 6.62 | 4.83× |
+
+Compare rows 2 and 3. They reach effectively the same quality (+19.33% vs +18.42%), but mixed precision spends **5.42 bits per weight to get there and uniform INT4 at group 64 spends 4.50**. Shrinking the group is simply a more efficient way to spend the same bits than promoting whole matrix types to INT8.
+
+So the sensitivity result is real — the matrices genuinely differ by 16× — but acting on it *at the granularity of matrix type* is the wrong lever. Group size dominates. A finer-grained scheme (per-channel or outlier-aware, as GPTQ and AWQ do) might still win; promoting whole tensors does not.
+
+This was written into the README as a prediction before it was measured, and the measurement contradicted it. Reproduce with `python scripts/mixed_precision.py`.
 
 ### 4. Depth barely matters — a negative result
 
