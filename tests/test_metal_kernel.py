@@ -72,6 +72,22 @@ def main() -> int:
     a, b = layer(x), layer(x)
     check("same input -> identical output", np.array_equal(a, b))
 
+    print("\nbatched kernel vs numpy reference")
+    for out_f, in_f in [(896, 896), (4864, 896), (896, 4864)]:
+        for gs in (128, 64):
+            for B in (1, 5, 33):
+                W = rng.normal(0, 0.02, (out_f, in_f)).astype(np.float32)
+                X = rng.normal(0, 1.0, (B, in_f)).astype(np.float32)
+                cfg = QuantConfig(bits=4, group_size=gs, symmetric=False)
+
+                ref = X @ dequantize(quantize(W, cfg)).T
+                got = MetalInt4Linear(W, cfg).batched(X)
+
+                diff = float(np.abs(got - ref).max())
+                check(f"batched out=({out_f},{in_f}) gs={gs} B={B}",
+                      got.shape == ref.shape and diff < 1e-3,
+                      f"shape {got.shape}, max diff {diff:.2e}")
+
     print("\nweights are uploaded once, not per call")
     calls = [layer(rng.normal(0, 1.0, 512).astype(np.float32)) for _ in range(5)]
     ref_calls = [dequantize(layer.qt) @ c for c in

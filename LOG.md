@@ -186,3 +186,53 @@ real one) rather than a guess. The mistake I did not make: reporting the
 1.07x-13.9x win over CPU-dequant and stopping there, which would have
 implied a GPU win without ever comparing against the baseline that actually
 matters -- plain fp32 BLAS, which was already the production path.
+
+## 2026-08-16 — batching didn't fix it, and the reason matters more than the result
+
+**Symptom:** the previous entry found the Metal kernel losing to fp32 BLAS at
+batch=1 and traced it to ~0.24ms of fixed per-dispatch overhead. The natural
+next hypothesis: batch many rows into one dispatch, pay that fixed cost once
+instead of once per row, and the kernel should close the gap or win outright.
+
+**Thought it was:** correct, and testable -- built `int4_matmat.metal`, a 2D
+kernel (thread per output-feature x batch-row) so one command buffer processes
+the whole batch, verified against the numpy reference across every real matrix
+shape and five batch sizes up to 128 (40/40 exact), then swept batch size
+against fp32 BLAS.
+
+**Actually was:** the gap does not close. It widens.
+
+    896x896,    batch=1:   0.01x    batch=256:  0.14x
+    4864x896,   batch=1:   0.42x    batch=256:  0.12x
+    896x4864,   batch=1:   0.24x    batch=256:  0.12x
+
+The per-row cost of the Metal kernel *did* improve with batching (896x896 at
+batch=256 is ~9.5us/row against ~1000us for a single batch=1 dispatch, so the
+fixed cost genuinely did amortize, confirming that part of the earlier
+diagnosis was right). But fp32 BLAS improves *faster*: from the batch-scaling
+check two entries back, Accelerate goes from 214us/row at batch=1 to
+11us/row at batch=128 on the same hardware. Both paths benefit from batching;
+BLAS benefits more, so the relative gap does not close and by batch=256 it is
+worse than at batch=1 on two of three shapes.
+
+The reason is architectural, not a tuning knob: the kernel is one thread per
+(output feature, batch row), each independently doing a scalar loop over
+`in_features` with no data reuse across threads. It does not use Metal's
+`simdgroup_matrix` instructions or any tiling, so it never gets the
+register-blocked, cache-tiled matrix-matrix multiply that Accelerate's BLAS
+(backed by the AMX coprocessor on Apple Silicon) already does. Batching more
+rows into a naive per-thread kernel is still `O(batch x out_features)`
+independent scalar dot products -- more parallel work, not more efficient
+work.
+
+**Cost:** ~50 minutes, and the finding survives being wrong about the fix.
+"Dispatch overhead is the bottleneck at batch=1" was correct and confirmed.
+"Batching will fix it" was a reasonable next hypothesis and was wrong, and the
+benchmark says exactly why: a hand-written scalar kernel cannot out-execute
+tuned matrix-matrix BLAS no matter how the dispatch is batched -- closing that
+gap needs SIMD-group matrix instructions or MPSGraph, which is a genuinely
+different (and larger) piece of work, not a follow-up tweak. That is the
+honest stopping point for phase 7: the profiling-driven float64 fix was a
+real, shipped 1.95x win; the GPU kernel was a real, correctly-executed
+experiment that says plain BLAS is the right choice on this hardware at these
+sizes, and says precisely what a naive kernel would need to stop losing.

@@ -24,7 +24,7 @@ allowing for quick retrieval of information.
 | 4. KV cache | ✅ | output ids **identical** to uncached, 1.33×→6.29× as context grows 32→512 |
 | 5. Sampling | ✅ | temperature / top-k / top-p, seeded and reproducible |
 | 6. Quantization + study | ✅ | INT8 free, INT4 costly, and the cost is **not uniform** — see below |
-| 7. Optimize the hot path | 🔨 | 1.95× from a float64 fix; Metal INT4 kernel built, correct, **loses to fp32 BLAS at batch=1** — see below |
+| 7. Optimize the hot path | ✅ | **1.95× shipped** from a float64 fix; Metal INT4 kernel built, verified, **loses to fp32 BLAS at every batch size tested** — see below |
 | 8. Benchmark vs llama.cpp | ⛔ | not started |
 
 Phases 1–6 are Python + NumPy, correctness first. Phases 7–8 move the hot path to C++/Metal.
@@ -142,7 +142,19 @@ It is correct — verified against the phase-6 `dequantize()` reference on every
 
 **It loses to plain fp32 BLAS on every shape.** Doc-1 rule: if your benchmark loses to the established library, publish the loss and explain why, so here is why — measured, not guessed. Dispatching the identical kernel against an 8×64 matrix with almost nothing to compute still costs 0.24 ms; the full 896×896 shape costs 0.29 ms. The real arithmetic is ~0.04 ms; the other ~0.24 ms is fixed cost from creating a command buffer, encoding, committing, and `waitUntilCompleted()` synchronously. fp32 BLAS at this size is an in-process library call with none of that — 0.013 ms.
 
-At batch=1, a single decode token is too little work to amortize a GPU dispatch. This isn't specific to Metal: fp32 BLAS itself goes from 214 µs/row at batch 1 down to 11 µs/row at batch 128 — even the CPU path is dominated by fixed costs at this size. The shapes where this kernel's real advantage (4× fewer weight bytes read per row) should show up are prefill or batched serving, not one-token-at-a-time decode — not yet measured. Reproduce with `python scripts/bench_metal.py`; full account in [`LOG.md`](LOG.md).
+At batch=1, a single decode token is too little work to amortize a GPU dispatch. This isn't specific to Metal: fp32 BLAS itself goes from 214 µs/row at batch 1 down to 11 µs/row at batch 128 — even the CPU path is dominated by fixed costs at this size.
+
+**The obvious next hypothesis — batch many rows into one dispatch, pay the fixed cost once — was tested and refuted.** [`tinyinfer/kernels/int4_matmat.metal`](tinyinfer/kernels/int4_matmat.metal) processes a whole batch in a single command buffer (verified correct: 40/40 against the reference across every shape and five batch sizes up to 128). Swept against fp32 BLAS from batch 1 to 256:
+
+| Shape | batch 1 | batch 4 | batch 16 | batch 64 | batch 256 |
+|---|---|---|---|---|---|
+| q/k/v/o_proj | 0.01× | 0.06× | 0.05× | 0.08× | 0.14× |
+| gate/up_proj | 0.42× | 0.92× | 0.38× | 0.18× | 0.12× |
+| down_proj | 0.24× | 0.71× | 0.32× | 0.16× | 0.12× |
+
+The gap doesn't close — it widens. The kernel's per-row cost does improve with batching (the fixed dispatch cost genuinely amortizes, confirming half the earlier diagnosis), but fp32 BLAS improves faster, because it isn't just avoiding dispatch overhead — it's running an AMX-tuned, register-blocked matrix-matrix multiply. This kernel is one thread per (output feature, batch row), each doing an independent scalar loop with no data reuse across threads: more parallel work at larger batch, not more *efficient* work. Closing that gap needs Metal's `simdgroup_matrix` tiling or MPSGraph, not a bigger batch — a materially different piece of work than what's here.
+
+**Where phase 7 actually lands:** the profiling-driven float64 fix is a real, shipped 1.95× win. The GPU kernel is a correctly-built, correctly-verified experiment whose result is that a naive per-thread Metal kernel is the wrong tool against Accelerate's BLAS on this hardware at these sizes — and the benchmark says exactly why, which is more useful than a kernel that happened to win without anyone knowing the reason. Reproduce with `python scripts/bench_metal.py` and `python scripts/bench_metal_batched.py`; full account in [`LOG.md`](LOG.md).
 
 ## How it works
 

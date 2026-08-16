@@ -26,11 +26,16 @@ import numpy as np
 
 from .quant import QuantConfig, QuantizedTensor, quantize
 
-_KERNEL_SRC = (Path(__file__).parent / "kernels" / "int4_matvec.metal").read_text()
+_KERNELS_DIR = Path(__file__).parent / "kernels"
+_KERNEL_SRC = "\n".join(
+    (_KERNELS_DIR / name).read_text()
+    for name in ("int4_matvec.metal", "int4_matmat.metal")
+)
 
 _device = None
 _queue = None
-_pipeline = None
+_pipeline = None       # int4_matvec: batch=1
+_pipeline_batched = None  # int4_matmat: batch>1, one dispatch for the whole batch
 
 
 def available() -> bool:
@@ -43,9 +48,9 @@ def available() -> bool:
 
 
 def _ensure_pipeline():
-    global _device, _queue, _pipeline
+    global _device, _queue, _pipeline, _pipeline_batched
     if _pipeline is not None:
-        return _device, _queue, _pipeline
+        return _device, _queue, _pipeline, _pipeline_batched
 
     import Metal
 
@@ -58,13 +63,19 @@ def _ensure_pipeline():
     if library is None:
         raise RuntimeError(f"Metal shader compile failed: {err}")
 
-    fn = library.newFunctionWithName_("int4_matvec")
-    pipeline, err = device.newComputePipelineStateWithFunction_error_(fn, None)
-    if pipeline is None:
-        raise RuntimeError(f"Metal pipeline creation failed: {err}")
+    def make_pipeline(fn_name: str):
+        fn = library.newFunctionWithName_(fn_name)
+        pipeline, err = device.newComputePipelineStateWithFunction_error_(fn, None)
+        if pipeline is None:
+            raise RuntimeError(f"Metal pipeline creation failed for {fn_name}: {err}")
+        return pipeline
 
-    _device, _queue, _pipeline = device, device.newCommandQueue(), pipeline
-    return _device, _queue, _pipeline
+    pipeline = make_pipeline("int4_matvec")
+    pipeline_batched = make_pipeline("int4_matmat")
+
+    _device, _queue = device, device.newCommandQueue()
+    _pipeline, _pipeline_batched = pipeline, pipeline_batched
+    return _device, _queue, _pipeline, _pipeline_batched
 
 
 def _shared_buffer(device, arr: np.ndarray):
@@ -106,7 +117,7 @@ class MetalInt4Linear:
         self.n_groups = self.qt.scale.shape[1]
         self.padded_cols = self.qt.q.shape[1] * self.qt.q.shape[2]
 
-        device, self.queue, self.pipeline = _ensure_pipeline()
+        device, self.queue, self.pipeline, self.pipeline_batched = _ensure_pipeline()
         self.device = device
 
         q_flat = self.qt.q.reshape(self.out_features, -1)
@@ -152,6 +163,55 @@ class MetalInt4Linear:
 
         mv = self._y_buf.contents().as_buffer(self.out_features * 4)
         return np.frombuffer(mv, dtype=np.float32).copy()
+
+    def batched(self, X: np.ndarray) -> np.ndarray:
+        """X: (batch, in_features) -> (batch, out_features), one dispatch total.
+
+        This is the point of the batched kernel: `batch` calls to `__call__`
+        would pay the ~0.24ms fixed dispatch cost `batch` times (see
+        LOG.md, 2026-08-16, on the batch=1 result). This pays it once, for the
+        whole batch, by using a 2D thread grid (out_features x batch) in a
+        single command buffer.
+        """
+        import Metal
+
+        if X.ndim != 2 or X.shape[1] != self.in_features:
+            raise ValueError(f"expected X of shape (batch, {self.in_features}), "
+                             f"got {X.shape}")
+        batch = X.shape[0]
+
+        x_buf = _shared_buffer(self.device, X.astype(np.float32, copy=False))
+        out_f_buf = _u32_buffer(self.device, self.out_features)
+        y_buf = self.device.newBufferWithLength_options_(
+            batch * self.out_features * 4, Metal.MTLResourceStorageModeShared
+        )
+
+        cb = self.queue.commandBuffer()
+        enc = cb.computeCommandEncoder()
+        enc.setComputePipelineState_(self.pipeline_batched)
+        enc.setBuffer_offset_atIndex_(x_buf, 0, 0)
+        enc.setBuffer_offset_atIndex_(self._q_buf, 0, 1)
+        enc.setBuffer_offset_atIndex_(self._s_buf, 0, 2)
+        enc.setBuffer_offset_atIndex_(self._z_buf, 0, 3)
+        enc.setBuffer_offset_atIndex_(y_buf, 0, 4)
+        enc.setBuffer_offset_atIndex_(self._in_f_buf, 0, 5)
+        enc.setBuffer_offset_atIndex_(self._ng_buf, 0, 6)
+        enc.setBuffer_offset_atIndex_(self._gs_buf, 0, 7)
+        enc.setBuffer_offset_atIndex_(self._pc_buf, 0, 8)
+        enc.setBuffer_offset_atIndex_(out_f_buf, 0, 9)
+
+        grid = Metal.MTLSizeMake(self.out_features, batch, 1)
+        # Threadgroup width capped by the pipeline's own limit; height 1 keeps
+        # each group within a single batch row so no group spans two rows.
+        tg_w = min(self.out_features, self.pipeline_batched.maxTotalThreadsPerThreadgroup())
+        tg = Metal.MTLSizeMake(tg_w, 1, 1)
+        enc.dispatchThreads_threadsPerThreadgroup_(grid, tg)
+        enc.endEncoding()
+        cb.commit()
+        cb.waitUntilCompleted()
+
+        mv = y_buf.contents().as_buffer(batch * self.out_features * 4)
+        return np.frombuffer(mv, dtype=np.float32).reshape(batch, self.out_features).copy()
 
     @property
     def compression(self) -> float:
