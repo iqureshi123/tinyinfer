@@ -146,3 +146,43 @@ invisible to correctness testing by construction. It shows up in a profile or
 it does not show up at all. `tests/test_dtypes.py` now asserts the dtype of
 every primitive, every cached weight, and the full forward pass, so the next
 one fails a test instead of a benchmark.
+
+## 2026-08-16 — the Metal INT4 kernel is correct and loses to fp32 BLAS anyway
+
+**Symptom:** not a bug — a benchmark result nobody wants. The fused INT4
+dequant+matvec kernel (`tinyinfer/kernels/int4_matvec.metal`) passed every
+correctness check against the phase-6 NumPy reference (max diff ~4e-6 across
+all four real model matrix shapes) and clearly beat the naive
+"dequantize-to-fp32-then-BLAS" path (1.07x-13.9x). It still lost to plain fp32
+BLAS on two of three shapes: 0.66x on gate/up_proj, 0.26x on down_proj, only
+essentially tied (1.07x... actually below 1x) on the attention projections.
+
+**Thought it was:** the GPU kernel being slow — bad thread/threadgroup sizing,
+or the per-group loop in MSL being poorly optimized versus Accelerate's
+hand-tuned matvec.
+
+**Actually was:** dispatch overhead, not compute. Dispatching the identical
+kernel against a near-empty 8x64 matrix (almost nothing to compute) still cost
+0.24 ms. The full 896x896 shape cost 0.29 ms -- so the real arithmetic adds
+only ~0.04 ms on top of a ~0.24 ms *fixed* cost from creating a command buffer,
+encoding, committing, and calling `waitUntilCompleted()` synchronously. fp32
+BLAS at this size is an in-process library call with no such cost: 0.013 ms.
+
+At batch=1 (a single decode token) the matmul itself is tiny enough that
+GPU dispatch latency dominates the entire operation, regardless of how fast
+the kernel's arithmetic is. Checked whether this is fundamental or an artifact
+of batch=1: fp32 BLAS itself goes from 214 us/row at batch=1 down to 11 us/row
+at batch=128, i.e. even the CPU path amortizes fixed costs across a batch. A
+fixed ~0.24ms-per-call GPU overhead would matter far less once amortized
+across many rows -- which decode, one token at a time, structurally never
+provides. Prefill (many tokens at once) or batched serving (many sequences at
+once) are the shapes where this kernel's real advantage -- reading 4x fewer
+weight bytes per row -- would actually show up.
+
+**Cost:** ~45 minutes, and the honest number is more useful than a flattering
+one. Doc 1's rule is publish the loss and explain why, and here the "why" is a
+measured root cause (an isolated near-empty dispatch costs the same as the
+real one) rather than a guess. The mistake I did not make: reporting the
+1.07x-13.9x win over CPU-dequant and stopping there, which would have
+implied a GPU win without ever comparing against the baseline that actually
+matters -- plain fp32 BLAS, which was already the production path.

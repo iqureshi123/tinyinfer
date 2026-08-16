@@ -24,7 +24,7 @@ allowing for quick retrieval of information.
 | 4. KV cache | ✅ | output ids **identical** to uncached, 1.33×→6.29× as context grows 32→512 |
 | 5. Sampling | ✅ | temperature / top-k / top-p, seeded and reproducible |
 | 6. Quantization + study | ✅ | INT8 free, INT4 costly, and the cost is **not uniform** — see below |
-| 7. Optimize the hot path | 🔨 | profiled; **1.95× from a float64 promotion fix**; Metal kernels not started |
+| 7. Optimize the hot path | 🔨 | 1.95× from a float64 fix; Metal INT4 kernel built, correct, **loses to fp32 BLAS at batch=1** — see below |
 | 8. Benchmark vs llama.cpp | ⛔ | not started |
 
 Phases 1–6 are Python + NumPy, correctness first. Phases 7–8 move the hot path to C++/Metal.
@@ -128,6 +128,22 @@ Where the time actually goes, per decode token ([`results/profile.json`](results
 
 Reproduce with `python scripts/bench.py` and `python scripts/profile_forward.py`.
 
+### The Metal kernel, and losing to fp32 BLAS honestly
+
+Following that profile, [`tinyinfer/kernels/int4_matvec.metal`](tinyinfer/kernels/int4_matvec.metal) fuses INT4 dequantization directly into the matvec — it reads each weight byte once and accumulates, rather than materializing a full fp32 matrix and calling BLAS on it. No Xcode is needed: `xcrun metal` requires a full Xcode install, but the Metal *framework* compiles shader source at runtime via `newLibraryWithSource:`, the same mechanism llama.cpp's Metal backend uses. [`tinyinfer/metal_backend.py`](tinyinfer/metal_backend.py) drives it through PyObjC, with weights uploaded to the GPU once at construction and reused every call.
+
+It is correct — verified against the phase-6 `dequantize()` reference on every real matrix shape in the model, max diff ~4e-6 ([`tests/test_metal_kernel.py`](tests/test_metal_kernel.py)) — and it clearly beats the naive "dequantize-then-BLAS" path:
+
+| Shape | fp32 BLAS | CPU dequant→BLAS | Metal INT4 | vs fp32 | vs CPU dequant |
+|---|---|---|---|---|---|
+| q/k/v/o_proj (896×896) | 0.013 ms | 0.748 ms | 0.702 ms | 0.02× | 1.07× |
+| gate/up_proj (4864×896) | 0.221 ms | 4.618 ms | 0.333 ms | 0.66× | **13.86×** |
+| down_proj (896×4864) | 0.215 ms | 4.465 ms | 0.825 ms | 0.26× | 5.41× |
+
+**It loses to plain fp32 BLAS on every shape.** Doc-1 rule: if your benchmark loses to the established library, publish the loss and explain why, so here is why — measured, not guessed. Dispatching the identical kernel against an 8×64 matrix with almost nothing to compute still costs 0.24 ms; the full 896×896 shape costs 0.29 ms. The real arithmetic is ~0.04 ms; the other ~0.24 ms is fixed cost from creating a command buffer, encoding, committing, and `waitUntilCompleted()` synchronously. fp32 BLAS at this size is an in-process library call with none of that — 0.013 ms.
+
+At batch=1, a single decode token is too little work to amortize a GPU dispatch. This isn't specific to Metal: fp32 BLAS itself goes from 214 µs/row at batch 1 down to 11 µs/row at batch 128 — even the CPU path is dominated by fixed costs at this size. The shapes where this kernel's real advantage (4× fewer weight bytes read per row) should show up are prefill or batched serving, not one-token-at-a-time decode — not yet measured. Reproduce with `python scripts/bench_metal.py`; full account in [`LOG.md`](LOG.md).
+
 ## How it works
 
 ```
@@ -168,6 +184,7 @@ python tests/test_forward.py        # phase 3 — logits vs transformers
 python tests/test_kv_cache.py       # phase 4 — cached == uncached
 python tests/test_sampling.py       # phase 5 — reproducibility
 python tests/test_dtypes.py         # phase 7 — no silent float64 promotion
+python tests/test_metal_kernel.py   # phase 7 — Metal kernel vs numpy reference (skips off-Apple)
 python scripts/quant_study.py       # phase 6 — the study
 ```
 

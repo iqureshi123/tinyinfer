@@ -5,3 +5,5 @@ tokenizers>=0.20      # phase 2 oracle
 torch>=2.4            # phase 3 oracle
 transformers>=4.43    # phase 3 oracle
 huggingface_hub>=0.24 # model download
+pyobjc-framework-Metal>=10.0  # phase 7 Metal backend, macOS only
+pyobjc-framework-Cocoa>=10.0
