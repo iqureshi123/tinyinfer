@@ -25,7 +25,7 @@ allowing for quick retrieval of information.
 | 5. Sampling | ✅ | temperature / top-k / top-p, seeded and reproducible |
 | 6. Quantization + study | ✅ | INT8 free, INT4 costly, and the cost is **not uniform** — see below |
 | 7. Optimize the hot path | ✅ | **1.95× shipped** from a float64 fix; Metal INT4 kernel built, verified, **loses to fp32 BLAS at every batch size tested** — see below |
-| 8. Benchmark vs llama.cpp | ⛔ | not started |
+| 8. Benchmark vs llama.cpp | ✅ | within **1.14×** on matched fp32/CPU; **6.6×** behind its Q4_K_M Metal path — and the gap is quantized kernels, not the GPU |
 
 Phases 1–6 are Python + NumPy, correctness first. Phases 7–8 move the hot path to C++/Metal.
 
@@ -156,6 +156,35 @@ The gap doesn't close — it widens. The kernel's per-row cost does improve with
 
 **Where phase 7 actually lands:** the profiling-driven float64 fix is a real, shipped 1.95× win. The GPU kernel is a correctly-built, correctly-verified experiment whose result is that a naive per-thread Metal kernel is the wrong tool against Accelerate's BLAS on this hardware at these sizes — and the benchmark says exactly why, which is more useful than a kernel that happened to win without anyone knowing the reason. Reproduce with `python scripts/bench_metal.py` and `python scripts/bench_metal_batched.py`; full account in [`LOG.md`](LOG.md).
 
+### Phase 8 — against llama.cpp, on identical weights
+
+A comparison only means anything if both engines run the same model, so the GGUF is converted from the exact `model.safetensors` this repo parses in phase 1, not downloaded pre-built. Both engines report **494,032,768 parameters**; [`scripts/bench_llamacpp.py`](scripts/bench_llamacpp.py) asserts that and fails loudly if it ever drifts.
+
+Every row below comes from one run, on one machine, in one session. That matters more than it sounds: comparing today's llama.cpp against the fp32 figures in the table above — measured in a different session — would not be a valid comparison, so all of it is re-measured together. llama.cpp at `60adddd`, Metal enabled, prefill 14 tokens, decode 64, 5 repetitions.
+
+| engine | prefill tok/s | decode tok/s | vs tinyinfer |
+|---|---|---|---|
+| **tinyinfer fp32 CPU** | 157.7 | 37.2 | — |
+| llama.cpp F32 CPU | 190.7 | 42.4 | 1.14× |
+| llama.cpp F32 Metal | 651.1 | 61.0 | 1.6× |
+| llama.cpp Q8_0 Metal | 1007.3 | 205.3 | 5.5× |
+| llama.cpp Q4_K_M CPU | 410.9 | 179.4 | 4.8× |
+| llama.cpp Q4_K_M Metal | 981.0 | 243.5 | **6.6×** |
+
+Two results, and the second is the one worth having.
+
+**On the like-for-like comparison the gap is small.** Same fp32, same CPU, same Accelerate BLAS underneath: 37.2 tok/s against 42.4, so llama.cpp decodes 1.14× faster. Re-measuring tinyinfer *after* all five llama.cpp passes gives 37.7 tok/s, so the bias from measurement order is 1.12×–1.14× — not enough to move the conclusion. A from-scratch NumPy engine lands within about 14% of llama.cpp when neither side gets quantized kernels or a GPU. Prefill is the weaker half at 1.21× behind, which is where llama.cpp's batching shows.
+
+**The 6.6× headline is not the GPU.** Compare llama.cpp against itself: Q4_K_M on the *CPU* decodes at 179.4 tok/s while F32 on *Metal* manages 61.0. Quantized CPU kernels beat the fp32 GPU path by 2.9×. Moving F32 from CPU to Metal buys 1.4×; quantizing F32→Q4_K_M on the same CPU buys 4.2×. The device is the smaller variable. The kernel operating on quantized data directly is the larger one.
+
+That is the phase 7 finding arriving from the other direction. The hand-written Metal INT4 kernel lost to Accelerate BLAS because it was a naive scalar kernel with no tiling and no data reuse; what actually wins is a dequant-free *blocked* matmul, and llama.cpp shows a CPU doing it well enough to beat an untuned GPU. tinyinfer still dequantizes INT4 to fp32 before every matmul, which is exactly why its quantization buys compression and no speed — and that one architectural choice, not the missing GPU, is most of the remaining 6.6×.
+
+```bash
+python scripts/bench_llamacpp.py --llama-bench /path/to/llama.cpp/build/bin/llama-bench
+```
+
+llama.cpp is invoked as an external binary for comparison. Nothing in `tinyinfer/` imports or links it.
+
 ## How it works
 
 ```
@@ -204,8 +233,8 @@ The tokenizer corpus covers whitespace runs, CJK, ZWJ emoji sequences, NFC/NFD p
 
 ## Limitations
 
-- **No GPU path yet.** Everything runs on NumPy over Accelerate BLAS. The tokens/sec figures are what a correctness-first CPU implementation gives you, and are not competitive with llama.cpp. That comparison is phase 8 and will be published whether or not it wins.
-- **Quantized weights are dequantized to fp32 before the matmul.** That measures the quality cost exactly, which is what the study is for, but it means quantization currently buys compression and not speed. Real throughput needs the INT4 kernel.
+- **No GPU path in the generation loop.** Everything runs on NumPy over Accelerate BLAS. Phase 8 measured the cost precisely: 1.14× behind llama.cpp on matched fp32/CPU, and 6.6× behind its Q4_K_M Metal path.
+- **Quantized weights are dequantized to fp32 before the matmul.** That measures the quality cost exactly, which is what the study is for, but it means quantization currently buys compression and not speed. Phase 8 puts a number on it: llama.cpp gets 4.2× on the same CPU purely from keeping the matmul in quantized space.
 - **One model, one machine.** Everything here is Qwen2.5-0.5B on an M5. Nothing has been checked against a second architecture or a non-Apple target.
 - **Perplexity is measured on one corpus** (Alice in Wonderland). It is public-domain, shipped in the repo, and reproducible offline — but a single domain, and the quantization result could differ on code or multilingual text.
 

@@ -85,7 +85,7 @@ def measure_tinyinfer(n_prompt_tokens: int, n_new: int) -> dict:
         steps.append(time.perf_counter() - t0)
 
     return {
-        "n_params": int(sum(w.size for w in model.iter_weights())) if hasattr(model, "iter_weights") else None,
+        "n_params": int(model.st.total_params),
         "prefill_tok_s": len(prompt_ids) / prefill,
         "decode_tok_s": 1.0 / float(np.mean(steps)),
         "decode_p50_ms": pct(steps, 50) * 1e3,
@@ -155,7 +155,11 @@ def main() -> int:
         "engines": {},
     }
 
-    print("measuring tinyinfer (NumPy fp32 / Accelerate BLAS) ...")
+    # Measured before *and* after the llama.cpp passes. Measurement order is
+    # not neutral: whichever engine runs first gets an idle, cool machine. The
+    # spread between these two runs is the size of that bias, and quoting only
+    # the favourable one would flatter this repo's own engine.
+    print("measuring tinyinfer (NumPy fp32 / Accelerate BLAS), cold ...")
     ti = measure_tinyinfer(n_prompt, n_new)
     out["engines"]["tinyinfer fp32 CPU"] = ti
 
@@ -169,6 +173,10 @@ def main() -> int:
         if res:
             out["engines"][label] = res
 
+    print("measuring tinyinfer again, after the llama.cpp passes ...")
+    ti_warm = measure_tinyinfer(n_prompt, n_new)
+    out["tinyinfer_second_pass"] = ti_warm
+
     # ---- table ----
     base = ti["decode_tok_s"]
     print(f"\n{'engine':<26}{'prefill tok/s':>14}{'decode tok/s':>14}{'vs tinyinfer':>14}")
@@ -181,6 +189,14 @@ def main() -> int:
 
     print(f"\ntinyinfer decode latency   p50 {ti['decode_p50_ms']:.1f} ms  "
           f"p99 {ti['decode_p99_ms']:.1f} ms")
+    print(f"tinyinfer re-measured after the llama.cpp passes: "
+          f"{ti_warm['decode_tok_s']:.1f} tok/s decode "
+          f"({ti_warm['prefill_tok_s']:.1f} prefill)")
+    lo, hi = sorted((ti["decode_tok_s"], ti_warm["decode_tok_s"]))
+    print(f"  -> order-of-measurement spread: {lo:.1f}-{hi:.1f} tok/s. "
+          f"Against llama.cpp F32 CPU that is "
+          f"{out['engines']['llama.cpp F32 CPU']['decode_tok_s'] / hi:.2f}x-"
+          f"{out['engines']['llama.cpp F32 CPU']['decode_tok_s'] / lo:.2f}x.")
 
     # Parameter counts must match or the comparison is meaningless.
     counts = {r.get("n_params") for r in out["engines"].values() if r.get("n_params")}

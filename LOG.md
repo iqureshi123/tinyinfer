@@ -236,3 +236,59 @@ honest stopping point for phase 7: the profiling-driven float64 fix was a
 real, shipped 1.95x win; the GPU kernel was a real, correctly-executed
 experiment that says plain BLAS is the right choice on this hardware at these
 sizes, and says precisely what a naive kernel would need to stop losing.
+
+## 2026-08-19 — the 6.6x gap to llama.cpp is quantized kernels, not the GPU
+
+Phase 8, and the number I expected to be embarrassing wasn't the embarrassing
+one.
+
+The setup mattered more than the measurement. A benchmark against llama.cpp is
+worthless if the two engines are running different weights, so the GGUF is
+converted from the same `model.safetensors` this repo parses in phase 1 rather
+than pulled pre-built from HuggingFace. Both sides report 494,032,768
+parameters and the harness asserts it -- the first version of that assertion
+silently passed while comparing llama.cpp against itself, because tinyinfer's
+parameter count came back `None` and got filtered out of the set. A check that
+cannot fail is not a check.
+
+Everything is measured in one process in one session. Comparing today's
+llama.cpp against the fp32 table from Aug 15 would have been invalid, and
+tempting, because the Aug 15 decode figure (26.2 tok/s) is slower than what
+this machine does now (37.2). Nothing in the engine changed between those two
+numbers. Machine state did.
+
+I also measured tinyinfer twice, once before the llama.cpp passes and once
+after, on the theory that whichever engine runs first gets a cool idle machine
+and that ordering bias would be worth disclosing. It came out at 37.2 and 37.7
+-- a 1.3% spread. The bias I went looking for isn't there at this scale, which
+is a duller result than I wanted but is the one worth recording. A separate
+`bench.py --quick` run in the middle of all this reported 29.7 tok/s, which
+looked like a regression for about a minute before the percentiles explained
+it: 24 samples with a 51ms p99 and a 53ms max. Small-n plus outliers, not a
+real change.
+
+The like-for-like result is that tinyinfer decodes at 37.2 tok/s against
+llama.cpp's 42.4 on matched fp32/CPU. 1.14x. I did not expect to land within
+14% of it on anything.
+
+The real finding is in llama.cpp's own rows. Q4_K_M on the CPU decodes at
+179.4 tok/s; F32 on Metal manages 61.0. The quantized CPU path beats the fp32
+GPU path by 2.9x. Taking F32 from CPU to Metal is worth 1.4x. Quantizing
+F32 -> Q4_K_M on the same CPU is worth 4.2x. The device is the smaller
+variable by a wide margin.
+
+Which is phase 7 again, from the other side. The Metal INT4 kernel was correct
+and still lost to Accelerate BLAS, and the conclusion then was that a naive
+scalar kernel with no tiling cannot out-execute a tuned blocked matmul. Phase
+8 says the same thing in reverse: what wins is the dequant-free blocked
+matmul, and it wins so decisively that a CPU doing it beats a GPU not doing
+it. tinyinfer dequantizes INT4 to fp32 before every matmul, so it pays the
+memory traffic of fp32 and gets none of the arithmetic benefit -- that single
+choice, not the absent GPU, is most of the remaining 6.6x.
+
+**Cost:** ~90 minutes, most of it building llama.cpp and converting weights.
+The `xcrun metal` failure is worth noting for anyone without full Xcode:
+`GGML_METAL_EMBED_LIBRARY=ON` embeds the shader *source* and compiles it at
+runtime, which needs no Metal compiler at build time. I set it to OFF first,
+reasoning that "don't embed the library" meant "don't precompile it," and got
+it exactly backwards -- OFF is the path that shells out to `xcrun metal`.
